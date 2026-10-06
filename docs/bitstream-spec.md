@@ -123,8 +123,9 @@ uses the "wide" variant: bucket thresholds `4` if 96m > 16*avg, `2` if 96m > 6*a
 carried output (or the raw residual if flag = 0, in which case the filter advances as above) is the
 OLS residual, and the samples are `sample = ols_residual + ols_prediction`. The OLS predictor is
 backward-adaptive in IEEE-754 binary64 and is specified by `src/ols.rs` (n = m = 16, lambda = 0.998,
-solve every 16 samples, regularisation 1.0, Cholesky, strictly sequential scalar +, -, *, /, sqrt with
-no FMA and no reordering). The predictor state and its sample history start at zero in every chunk,
+solve every 16 samples, regularisation 1.0, Cholesky, binary64 +, -, *, /, sqrt only, no FMA; every sum
+receives its terms in the order of the plain sequential form, and an implementation may compute independent
+elements side by side, e.g. in SIMD lanes, but must not reorder the terms of any sum). The predictor state and its sample history start at zero in every chunk,
 and the OLS statistics (covariance, cross-correlation and the solve counter) are not updated for the
 first 16 frames of a chunk; with the first solve after 16 updates, at least the first 32
 predictions of each channel are 0. **Unlike every other part of this format, cfg 3 is therefore bit-exact only
