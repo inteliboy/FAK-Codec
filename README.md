@@ -7,7 +7,7 @@ contains the codec library, the `fak` command-line tool, the test suite and the 
 - **Format:** version 21, specification 1.1.0 ([`docs/bitstream-spec.md`](docs/bitstream-spec.md)).
 - **Language:** Rust (stable, edition 2021). The only runtime dependency is the optional `mimalloc` allocator.
 - **License:** MIT OR Apache-2.0, at your option.
-- **foobar2000:** the component is in a separate repository, [foo_input_fak](https://github.com/inteliboy/foo_input_fak).
+- **foobar2000:** the components (`foo_input_fak` for playback and Converter encoding, `foo_input_fak_adv` with the FAK menu and settings) are in a separate repository, [foo_input_fak](https://github.com/inteliboy/foo_input_fak).
 
 ## Compatibility
 
@@ -93,6 +93,20 @@ and vocal recordings; 240 s of audio in total), against FLAC 1.5.0 at `-8`; all 
 files (-5.1% in total) than on the 24-bit ones (-2.4%). Treat this as an indication, not a benchmark: it is
 12 excerpts, a single timing run and a single machine, and the files are mostly classical music. Results on
 other material, and on full-length files, will differ.
+
+Ten of those 12 files were used while developing the `insane` predictors, so that figure is optimistic. The same
+measurement was then made once on 5 recordings that were never used for tuning (2 piano pieces and a string
+quartet at 24-bit, 2 electronic/pop tracks at 16-bit; 100 s of audio), with the same method;
+all 20 decodes were bit-exact:
+
+| Codec | Size vs FLAC `-8` (total bytes) | Per-file range | Encode speed | Decode speed |
+|---|---|---|---|---|
+| FLAC 1.5.0 `-8` | baseline | | 205x realtime | 572x realtime |
+| FAK `max` | -1.74% | -1.1% to -4.6% | 35x | 438x |
+| FAK `insane` | -2.41% | -1.8% to -5.4% | 7x | 34x |
+
+On this set `insane` is 0.54% smaller than the 1.0.0 release's `insane` (every file smaller, -0.42% to -0.63%),
+at about 13 times the decode time. Five files and one timing run remain a small sample.
 
 ## Correctness and robustness
 

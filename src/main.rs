@@ -271,7 +271,7 @@ fn prepare_metadata(
     // `wav::read_wav`; the scale/exceptions needed to invert that on decode ride along in metadata.
     o.metadata.float_info = float_info;
     // The encoder string names what was asked of the encoder (the level is not recoverable from the
-    // stream): "fak 1.0.0 (level=normal; fec=none; chunk=auto)".
+    // stream): "fak 1.1.0 (level=normal; fec=none; chunk=auto)".
     if o.metadata.vendor.is_empty() {
         let level = if o.level == Level::Archival { "insane" } else { o.level.name() };
         o.metadata.vendor = format!(
