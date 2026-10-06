@@ -1,0 +1,35 @@
+[package]
+name = "fak"
+version = "1.0.0"
+edition = "2021"
+description = "FAK: a lossless audio codec, library and command-line tool"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/inteliboy/FAK-Codec"
+readme = "README.md"
+keywords = ["audio", "lossless", "codec", "compression"]
+categories = ["multimedia::audio", "compression"]
+
+[lib]
+name = "fak"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fak"
+path = "src/main.rs"
+
+[features]
+default = ["fast-alloc"]
+# mimalloc as the `fak` binary's global allocator (the encoder's candidate
+# search makes ~40k short-lived allocations per second of audio, and on Windows the system heap made
+# encode ~16% and decode ~15% slower than mimalloc (and made encode speed depend on heap history).
+# Output bytes are unaffected. `--no-default-features` builds with the system allocator.
+fast-alloc = ["dep:mimalloc"]
+# Research-only: records every residual block the block-mode encoder writes (`rice::TAP`), for
+# research tooling. Never enabled in normal builds.
+research-tap = []
+
+[profile.release]
+opt-level = 3
+
+[dependencies]
+mimalloc = { version = "0.1", default-features = false, optional = true }

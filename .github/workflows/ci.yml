@@ -1,0 +1,45 @@
+# Build and test on every supported platform. This repository is public, so the macOS and Windows
+# runners are free; nothing here is gated or sampled.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     label: linux-x86_64 }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64 }
+          - { os: macos-15,         label: macos-arm64 }
+          - { os: macos-15-intel,   label: macos-x86_64 }
+          - { os: windows-2025,     label: windows-x86_64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc -Vv
+      - name: Build
+        run: cargo build --release
+      - name: Version and CPU features (what the runtime dispatch will pick)
+        run: |
+          ./target/release/fak version
+          ./target/release/fak cpuinfo
+      - name: Tests
+        run: cargo test --release
