@@ -46,14 +46,31 @@ pub enum Phase {
     ValueMap,
     Palette,
     Sha,
+    /// Decoder: one chunk's whole decode (the total the decode shares are taken against).
+    DecChunk,
+    /// Inside `DecChunk`: Rice residual decoding.
+    DecRice,
+    /// Inside `DecChunk`: the carried LMS filter (inverse or advance).
+    DecCarried,
+    /// Inside `DecChunk`: the stereo OLS predictor (cfg 3/4 chunks).
+    DecOls,
+    /// Inside `DecChunk`: long-term prediction.
+    DecLtp,
+    /// Inside `DecChunk`: the per-block stage-2 filter.
+    DecStage2,
+    /// Inside `DecChunk`: cross-channel prediction.
+    DecCross,
+    /// Inside `DecChunk`: fixed/LPC sample reconstruction.
+    DecPredictor,
 }
 
-const NAMES: [&str; 25] = [
+const NAMES: [&str; 33] = [
     "chunk (total)", "analytic cover", "analyze prep", "mid/side", "autocorrelation", "levinson+quantize", "candidate ranking",
     "fixed orders", "lpc costing", "precision", "cross search", "  cross prep", "  cross normal eq", "  cross solve", "  cross residual",
     "final residual", "stage 2", "ltp (total)", "  ltp fft", "  ltp rank+fit", "  ltp pricing", "rice coding", "value map", "palette", "sha-256",
+    "decode chunk (total)", "  dec rice", "  dec carried lms", "  dec ols stereo", "  dec ltp", "  dec stage 2", "  dec cross", "  dec predictor",
 ];
-static TIMES: [AtomicU64; 25] = [const { AtomicU64::new(0) }; 25];
+static TIMES: [AtomicU64; 33] = [const { AtomicU64::new(0) }; 33];
 static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 fn enabled() -> bool { *ON.get_or_init(|| std::env::var_os("FAK_PROF").is_some()) }
@@ -70,8 +87,9 @@ impl Drop for Guard {
 /// Prints the table: seconds and share of the chunk total (indented phases are inside the one above).
 pub fn report() {
     if !enabled() { return; }
-    let chunk = TIMES[Phase::Chunk as usize].load(Relaxed);
-    eprintln!("--- FAK_PROF: encode phases, seconds and share of chunk time");
+    let (enc, dec) = (TIMES[Phase::Chunk as usize].load(Relaxed), TIMES[Phase::DecChunk as usize].load(Relaxed));
+    let chunk = if enc > 0 { enc } else { dec };
+    eprintln!("--- FAK_PROF: {} phases, seconds and share of chunk time", if enc > 0 { "encode" } else { "decode" });
     for (name, t) in NAMES.iter().zip(&TIMES) {
         let v = t.load(Relaxed);
         if v > 0 { eprintln!("{name:>22} {:8.3}s {:5.1}%", v as f64 / 1e9, 100.0 * v as f64 / chunk.max(1) as f64); }

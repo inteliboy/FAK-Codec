@@ -118,7 +118,7 @@ fn read_predicted(r: &mut BitReader, inner: SubframeType, n: usize, eff_bits: u3
     let lt = ltp::Params::read(r).map_err(FormatError)?;
     #[cfg(feature = "research-tap")]
     let (tr, _) = (r.bit_pos(), rice::DTAP.lock().unwrap().clear());
-    let mut res = rice::decode(r, n - res_start).map_err(bmap)?;
+    let mut res = { let _g = crate::prof::span(crate::prof::Phase::DecRice); rice::decode(r, n - res_start).map_err(bmap)? };
     #[cfg(feature = "research-tap")]
     {
         let mut t = TAP.lock().unwrap();
@@ -127,7 +127,7 @@ fn read_predicted(r: &mut BitReader, inner: SubframeType, n: usize, eff_bits: u3
         e.rice_bits = (r.bit_pos() - tr) as u32; e.rice_sel = std::mem::take(&mut *rice::DTAP.lock().unwrap());
         e.n = n as u32; e.kind = inner as u8 + if cross.is_some() { 8 } else { 0 };
     }
-    if let Some(p) = &lt { ltp::inverse(p, &mut res).map_err(|e| FormatError(e.into()))?; }
+    if let Some(p) = &lt { let _g = crate::prof::span(crate::prof::Phase::DecLtp); ltp::inverse(p, &mut res).map_err(|e| FormatError(e.into()))?; }
     // The tapped residual is the one before long-term prediction (what stage 2 or the predictor
     // left), so probes price LTP and alternatives to it from the same starting point.
     #[cfg(feature = "research-tap")]
@@ -136,8 +136,9 @@ fn read_predicted(r: &mut BitReader, inner: SubframeType, n: usize, eff_bits: u3
         let e = t.last_mut().unwrap();
         e.res = res.clone(); e.res_start = res_start as u32;
     }
-    if let Some(p) = &s2 { stage2::inverse(p, &mut res).map_err(|e| FormatError(e.into()))?; }
+    if let Some(p) = &s2 { let _g = crate::prof::span(crate::prof::Phase::DecStage2); stage2::inverse(p, &mut res).map_err(|e| FormatError(e.into()))?; }
     if let Some(c) = carry.as_deref_mut() {
+        let _g = crate::prof::span(crate::prof::Phase::DecCarried);
         match carried_s {
             Some(s) => c.inverse(&mut res, s).map_err(|e| FormatError(e.into()))?,
             None if !res.is_empty() && res.iter().all(|e| e.abs() <= stage2::MAX_RESIDUAL) => {
@@ -148,6 +149,7 @@ fn read_predicted(r: &mut BitReader, inner: SubframeType, n: usize, eff_bits: u3
         }
     }
     if let Some((p, refs)) = &cross {
+        let _g = crate::prof::span(crate::prof::Phase::DecCross);
         let rf = &refs[p.ref_idx as usize];
         let padded;
         let src: &[i64] = match p.source {
@@ -159,6 +161,7 @@ fn read_predicted(r: &mut BitReader, inner: SubframeType, n: usize, eff_bits: u3
         crossch::apply(p, src, res_start, &mut res, false).map_err(|e| FormatError(e.into()))?;
     }
     let err = |e: &'static str| FormatError(e.into());
+    let g_rec = crate::prof::span(crate::prof::Phase::DecPredictor);
     let mut out = Vec::with_capacity(n);
     match (&lpc_q, from_history) {
         (Some(q), true) => lpc::reconstruct_into(q, &hist[hist.len() - order..], &res, &mut out).map_err(err)?,
@@ -166,6 +169,7 @@ fn read_predicted(r: &mut BitReader, inner: SubframeType, n: usize, eff_bits: u3
         (None, true) => predictors::reconstruct_into(order as u8, &hist[hist.len() - order..], &res, &mut out).map_err(err)?,
         (None, false) => { out = predictors::reconstruct(order as u8, &warmup, &res).map_err(err)?; }
     }
+    drop(g_rec);
     #[cfg(feature = "research-tap")]
     if std::env::var_os("FAK_TAP_RES").is_some() { TAP.lock().unwrap().last_mut().unwrap().samples = out.clone(); }
     Ok((out, res, res_start))
@@ -888,7 +892,8 @@ fn decode_ols_chunk(data: &[u8], chunk_frames: usize, bits_per_sample: u8, irls:
         for c in carried.iter_mut() {
             let flag = r.read_bits(1).map_err(bmap)? == 1;
             let s = if flag { Some(stage2::Carried::read_s(&mut r).map_err(FormatError)?) } else { None };
-            let mut v = rice::decode(&mut r, n).map_err(bmap)?;
+            let mut v = { let _g = crate::prof::span(crate::prof::Phase::DecRice); rice::decode(&mut r, n).map_err(bmap)? };
+            let g_car = crate::prof::span(crate::prof::Phase::DecCarried);
             match s {
                 Some(s) => c.inverse(&mut v, s).map_err(|e| FormatError(e.into()))?,
                 None if v.iter().all(|e| e.abs() <= stage2::MAX_RESIDUAL) => {
@@ -897,9 +902,10 @@ fn decode_ols_chunk(data: &[u8], chunk_frames: usize, bits_per_sample: u8, irls:
                 }
                 None => {}
             }
+            drop(g_car);
             res.push(v);
         }
-        let (s0, s1) = st.inverse_block(&res[0], &res[1]);
+        let (s0, s1) = { let _g = crate::prof::span(crate::prof::Phase::DecOls); st.inverse_block(&res[0], &res[1]) };
         if s0.iter().chain(&s1).any(|&x| x < lo || x > hi) { return Err(FormatError("OLS chunk sample out of range (corrupted stream?)".into())); }
         out[0].extend(s0);
         out[1].extend(s1);
@@ -913,6 +919,7 @@ fn decode_ols_chunk(data: &[u8], chunk_frames: usize, bits_per_sample: u8, irls:
 /// Block-independent frames making up one chunk: exactly `chunk_frames` sample-frames, consuming
 /// exactly all of `data` (trailing bytes would mean the table and the frames disagree).
 fn decode_frames(data: &[u8], nch: usize, bits_per_sample: u8, chunk_frames: usize) -> Result<Vec<Vec<i64>>, FormatError> {
+    let _g = crate::prof::span(crate::prof::Phase::DecChunk);
     let mut channels: Vec<Vec<i64>> = (0..nch).map(|_| Vec::with_capacity(chunk_frames)).collect();
     let (maps, mut pos) = valuemap::read_section(data, nch, chunk_frames).map_err(FormatError)?;
     let cfg = *data.get(pos).ok_or_else(|| FormatError("missing chunk config byte".into()))?;

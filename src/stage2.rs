@@ -99,6 +99,7 @@ fn update_scalar(w: &mut [i16], x: &[i16], sign: i16, k: u32) {
 
 /// Lane-parallel dot product for the carried filter; wrapping i32 sums are order-independent, so this
 /// equals `dot_scalar` exactly while letting the compiler emit pmaddwd-style code.
+#[inline(always)]
 fn carried_dot(w: &[i16], x: &[i16]) -> i32 {
     let mut acc = [0i32; 16];
     let (wc, xc) = (w.chunks_exact(16), x.chunks_exact(16));
@@ -108,7 +109,56 @@ fn carried_dot(w: &[i16], x: &[i16]) -> i32 {
     for (&a, &b) in wr.iter().zip(xr) { t = t.wrapping_add(a as i32 * b as i32); }
     t
 }
+/// AVX2 dot product with `vpmaddwd` pair sums in wrapping i32. Wrapping sums are order-independent (they are sums modulo
+/// 2^32), and the one pair sum that overflows `vpmaddwd` (two products of -32768 * -32768) wraps to the same value as
+/// the scalar wrapping adds, so this equals `carried_dot` exactly. The compiler's own vectorisation of `carried_dot`
+/// used `vpmovsxwd` + `vpmulld` instead (H260).
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn carried_dot_avx2(w: &[i16], x: &[i16]) -> i32 {
+    use std::arch::x86_64::*;
+    let n = w.len().min(x.len());
+    let (wp, xp) = (w.as_ptr(), x.as_ptr());
+    let (mut a0, mut a1) = (_mm256_setzero_si256(), _mm256_setzero_si256());
+    let mut i = 0;
+    while i + 32 <= n {
+        let w0 = _mm256_loadu_si256(wp.add(i) as *const __m256i);
+        let x0 = _mm256_loadu_si256(xp.add(i) as *const __m256i);
+        let w1 = _mm256_loadu_si256(wp.add(i + 16) as *const __m256i);
+        let x1 = _mm256_loadu_si256(xp.add(i + 16) as *const __m256i);
+        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+        a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(w1, x1));
+        i += 32;
+    }
+    if i + 16 <= n {
+        let w0 = _mm256_loadu_si256(wp.add(i) as *const __m256i);
+        let x0 = _mm256_loadu_si256(xp.add(i) as *const __m256i);
+        a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(w0, x0));
+        i += 16;
+    }
+    let a = _mm256_add_epi32(a0, a1);
+    let s = _mm_add_epi32(_mm256_castsi256_si128(a), _mm256_extracti128_si256(a, 1));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b01_00_11_10));
+    let s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0b10_11_00_01));
+    let mut t = _mm_cvtsi128_si32(s);
+    while i < n {
+        t = t.wrapping_add(w[i] as i32 * x[i] as i32);
+        i += 1;
+    }
+    t
+}
+/// The dot product the carried filter uses: the AVX2 kernel inside the AVX2 clone (`AVX`), the portable one elsewhere.
+#[inline(always)]
+fn carried_dot_sel<const AVX: bool>(w: &[i16], x: &[i16]) -> i32 {
+    #[cfg(target_arch = "x86_64")]
+    if AVX {
+        // Safety: `AVX` is only set by `Carried::run_avx2`, which is only called after AVX2 was detected.
+        return unsafe { carried_dot_avx2(w, x) };
+    }
+    carried_dot(w, x)
+}
 /// Bucketed sign-sign update, `w += sign * ((d << 8) >> k)` clamped to +-32767, in i16 lanes.
+#[inline(always)]
 fn carried_update(w: &mut [i16], d: &[i16], sign: i16, k: u32) {
     for (w, &d) in w.iter_mut().zip(d) { *w = w.saturating_add(sign * ((d << 8) >> k)).max(-32767); }
 }
@@ -490,13 +540,26 @@ impl Carried {
     }
 
     fn run<const INVERSE: bool>(&mut self, data: &mut [i64], s: i32) -> Result<(), &'static str> {
+        #[cfg(target_arch = "x86_64")]
+        if crate::simd::avx2_enabled() {
+            // Safety: AVX2 confirmed at runtime. Integer-only code (wrapping dot products, saturating updates), so the
+            // clone's results are identical to the portable ones; the tests compare outputs and state.
+            return unsafe { self.run_avx2::<INVERSE>(data, s) };
+        }
+        self.run_impl::<INVERSE, false>(data, s)
+    }
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn run_avx2<const INVERSE: bool>(&mut self, data: &mut [i64], s: i32) -> Result<(), &'static str> { self.run_impl::<INVERSE, true>(data, s) }
+    #[inline(always)]
+    fn run_impl<const INVERSE: bool, const AVX: bool>(&mut self, data: &mut [i64], s: i32) -> Result<(), &'static str> {
         let taps = self.taps;
         let mut win: Vec<i16> = self.hist.iter().map(|&r| input(r, s)).collect();
         let mut adw: Vec<i16> = Vec::with_capacity(taps + data.len());
         for &x in &win { let b = self.bucket(x); adw.push(b); }
         win.reserve(data.len());
         for v in data.iter_mut() {
-            let pred = predict(carried_dot(&self.w, &win[win.len() - taps..]), s);
+            let pred = predict(carried_dot_sel::<AVX>(&self.w, &win[win.len() - taps..]), s);
             let (r, e) = if INVERSE {
                 let e = *v;
                 let r = e.checked_add(pred).filter(|r| r.abs() <= MAX_RESIDUAL).ok_or("stage-2 residual out of range (corrupted stream?)")?;
@@ -531,4 +594,77 @@ impl Carried {
     pub fn advance(&mut self, r: &[i64], s: i32) { let mut t = r.to_vec(); self.forward(&mut t, s); }
     /// Decoder direction.
     pub fn inverse(&mut self, e: &mut [i64], s: i32) -> Result<(), &'static str> { self.run::<true>(e, s) }
+}
+
+#[cfg(all(test, target_arch = "x86_64"))]
+mod carried_tests {
+    use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    fn next(seed: &mut u64) -> u64 { *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407); *seed >> 33 }
+
+    /// Residual-like test data: noise at several scales, a decaying tone, saturating extremes, zeros.
+    #[cfg(target_arch = "x86_64")]
+    fn data(kind: usize, len: usize, seed: u64) -> Vec<i64> {
+        let mut sd = seed;
+        (0..len).map(|t| {
+            let r = next(&mut sd) as i64;
+            match kind {
+                0 => (r % 2001) - 1000,
+                1 => (r % 200_001) - 100_000,
+                2 => ((t as f64 * 0.05).sin() * 30_000.0) as i64 + (r % 65) - 32,
+                3 => if (t / 5) % 2 == 0 { MAX_RESIDUAL } else { -MAX_RESIDUAL },
+                _ => if t % 7 == 0 { r % 9 - 4 } else { 0 },
+            }
+        }).collect()
+    }
+
+    /// The `vpmaddwd` dot product equals the scalar wrapping sum for every length (tails included) and for the extremes,
+    /// among them the all `-32768` case in which a pair sum overflows `vpmaddwd` itself.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn madd_dot_equals_the_scalar_dot() {
+        if !std::is_x86_feature_detected!("avx2") { return; }
+        let mut sd = 5u64;
+        for n in (0..200).chain([511, 512, 513, 1023, 1024, 1025]) {
+            for kind in 0..4 {
+                let gen = |sd: &mut u64| -> Vec<i16> { (0..n).map(|_| match kind { 0 => next(sd) as i16, 1 => i16::MIN, 2 => if next(sd) % 2 == 0 { i16::MIN } else { i16::MAX }, _ => (next(sd) % 7) as i16 - 3 }).collect() };
+                let (w, x) = (gen(&mut sd), gen(&mut sd));
+                let want = w.iter().zip(&x).fold(0i32, |a, (&p, &q)| a.wrapping_add(p as i32 * q as i32));
+                assert_eq!(unsafe { carried_dot_avx2(&w, &x) }, want, "n {n} kind {kind}");
+                assert_eq!(carried_dot(&w, &x), want, "portable dot, n {n} kind {kind}");
+            }
+        }
+    }
+
+    /// The AVX2 clone of the carried filter must reproduce the portable code exactly: outputs of both directions,
+    /// and the filter state (weights, history, bucket average) after every chunk.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn carried_avx2_clone_matches_the_portable_code() {
+        if !std::is_x86_feature_detected!("avx2") { return; }
+        for (taps, k, bits) in [(512usize, 8u32, 16u8), (512, 8, 24), (1024, 9, 24), (1024, 9, 16), (16, 3, 16), (48, 5, 24)] {
+            for kind in 0..5 {
+                for s in [-3, 0, 5, 14, 31] {
+                    let sig = data(kind, 3000, 11 * taps as u64 + kind as u64);
+                    let (mut p, mut v) = (Carried::new_ols(taps, k, bits), Carried::new_ols(taps, k, bits));
+                    let (mut pi, mut vi) = (Carried::new_ols(taps, k, bits), Carried::new_ols(taps, k, bits));
+                    for chunk in sig.chunks(700) {
+                        let (mut a, mut b) = (chunk.to_vec(), chunk.to_vec());
+                        p.run_impl::<false, false>(&mut a, s).unwrap();
+                        unsafe { v.run_avx2::<false>(&mut b, s) }.unwrap();
+                        assert_eq!(a, b, "forward differs (taps {taps} kind {kind} s {s})");
+                        assert!(p.w == v.w && p.hist == v.hist && p.avg == v.avg, "state differs after forward (taps {taps} kind {kind} s {s})");
+                        // decode the encoded chunk with the other implementation than the one that encoded it
+                        let (mut c, mut d) = (a.clone(), a.clone());
+                        pi.run_impl::<true, false>(&mut c, s).unwrap();
+                        unsafe { vi.run_avx2::<true>(&mut d, s) }.unwrap();
+                        assert_eq!(c, chunk, "portable inverse is not exact (taps {taps} kind {kind} s {s})");
+                        assert_eq!(d, chunk, "avx2 inverse is not exact (taps {taps} kind {kind} s {s})");
+                        assert!(pi.w == vi.w && pi.hist == vi.hist && pi.avg == vi.avg, "state differs after inverse");
+                    }
+                }
+            }
+        }
+    }
 }
