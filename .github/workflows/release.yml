@@ -1,0 +1,121 @@
+# Builds the `fak` command-line tool on GitHub-hosted runners and publishes it as a GitHub release.
+#
+#   * push a tag `vX.Y.Z` (it must equal the version in Cargo.toml): builds every platform, then creates
+#     the release with the archives and a SHA256SUMS file;
+#   * Actions > release > Run workflow with no tag: builds the same archives as workflow artifacts only
+#     (nothing is published), to check a build before tagging;
+#   * the same with a tag: publishes a release for an existing tag.
+#
+# The binaries are unsigned. Linux binaries are built on Ubuntu 24.04 (glibc 2.39).
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to publish as a release (empty: only build the archives as workflow artifacts)"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (${{ matrix.label }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { os: ubuntu-24.04,     label: linux-x86_64,   exe: "",     archive: tar.gz }
+          - { os: ubuntu-24.04-arm, label: linux-aarch64,  exe: "",     archive: tar.gz }
+          - { os: macos-15,         label: macos-arm64,    exe: "",     archive: tar.gz }
+          - { os: macos-15-intel,   label: macos-x86_64,   exe: "",     archive: tar.gz }
+          - { os: windows-2025,     label: windows-x86_64, exe: ".exe", archive: zip }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Toolchain
+        run: rustup toolchain install stable --profile minimal && rustup default stable && rustc -Vv
+      - name: Name this build
+        id: v
+        run: |
+          tag="${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || '' }}"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "name=${tag:-dev-${GITHUB_SHA::7}}" >> "$GITHUB_OUTPUT"
+      - name: The tag must match the crate version
+        if: steps.v.outputs.tag != ''
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          [ "v$crate" = "${{ steps.v.outputs.tag }}" ] || { echo "tag ${{ steps.v.outputs.tag }} does not match Cargo.toml version $crate"; exit 1; }
+      - name: Build
+        run: cargo build --release --locked
+      - name: Package
+        run: |
+          name="fak-${{ steps.v.outputs.name }}-${{ matrix.label }}"
+          mkdir "$name"
+          cp "target/release/fak${{ matrix.exe }}" README.md LICENSE-MIT LICENSE-APACHE docs/bitstream-spec.md "$name/"
+          if [ "${{ matrix.archive }}" = zip ]; then 7z a -tzip "$name.zip" "$name" > /dev/null; else tar -czf "$name.tar.gz" "$name"; fi
+          echo "PKG=$name" >> "$GITHUB_ENV"
+      - name: Smoke test the packaged binary (encode, verify, decode, compare)
+        run: |
+          python - <<'PY'
+          import math, struct, wave
+          w = wave.open("smoke.wav", "wb"); w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100)
+          w.writeframes(b"".join(struct.pack("<hh", int(12000 * math.sin(i * 0.05)), int(9000 * math.sin(i * 0.07))) for i in range(44100)))
+          w.close()
+          PY
+          "$PKG/fak${{ matrix.exe }}" version
+          "$PKG/fak${{ matrix.exe }}" encode --level insane smoke.wav smoke.fak
+          "$PKG/fak${{ matrix.exe }}" verify smoke.fak
+          "$PKG/fak${{ matrix.exe }}" decode smoke.fak smoke.out.wav
+          cmp smoke.wav smoke.out.wav
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fak-${{ matrix.label }}
+          path: ${{ env.PKG }}.${{ matrix.archive }}
+
+  release:
+    name: publish release
+    needs: build
+    if: github.event_name == 'push' || inputs.tag != ''
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: fak-*
+          merge-multiple: true
+          path: dist
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          (cd dist && sha256sum * > SHA256SUMS && cat SHA256SUMS)
+          cat > notes.md <<NOTES
+          Command-line tool \`fak\` for Linux (x86-64, aarch64), macOS (arm64, x86-64) and Windows (x86-64), built by
+          GitHub Actions from tag \`$TAG\` of this repository. Each archive holds the binary, the README, both licenses
+          and the bitstream specification; \`fak version\` prints the program and format versions.
+
+          Verify a download with \`sha256sum -c SHA256SUMS\` (or \`shasum -a 256 -c SHA256SUMS\` on macOS).
+
+          The binaries are not code-signed: Windows SmartScreen may warn, and on macOS you may need
+          \`xattr -d com.apple.quarantine fak\` after extracting. Linux binaries are built on Ubuntu 24.04 (glibc 2.39);
+          on older systems build from source (\`cargo build --release\`).
+          NOTES
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "FAK Codec $TAG" --notes-file notes.md --verify-tag
